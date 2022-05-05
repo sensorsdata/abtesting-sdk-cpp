@@ -17,7 +17,7 @@ A/B Testing SDK 是一款用于 A/B 测试的 SDK。
 
 ## 集成文档
 
-请参考神策官网 [C++ SDK（A/B Testing）集成文档](https://manual.sensorsdata.cn/sa/latest/page-34537618.html)。
+请参考神策官网 [C++ SDK（A/B Testing）集成文档](https://manual.sensorsdata.cn/abtesting/latest/c++-sdk-a-b-testing-71401507.html)。
 
 ## 版本更新记录
 
