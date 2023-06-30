@@ -29,7 +29,6 @@
 #include <sstream>
 #include <thread>
 
-#include "sensors_analytics_sdk.h"
 #include "sensors_json.hpp"
 #include "sensors_network.h"
 #include "sensors_utils.h"
@@ -214,20 +213,37 @@ bool HttpRequest::Request(const string &data,
   return true;
 }
 
+void ABTestPropertiesNode::SetList(const string &property_name, const std::vector<string> &value) {
+    try {
+        json value_json(value);
+        if (!value_json.is_null()) {
+            string value_string = value_json.dump();
+            SetString(property_name, value_string);
+        }
+    } catch (exception &err) {
+        LogError("ABTestPropertiesNode SetList failed to convert the value to a string : " + (string)err.what());
+    }
+}
+
+void ABTestPropertiesNode::SetObject(const string &property_name, const ObjectNode &value) {}
+
 class ABTestObserver;
 class DefaultConsumer {
  public:
   ABTestObserver *observer_;
 
-  DefaultConsumer(const string &server_url, const string &project_key);
+  DefaultConsumer(const string &server_url, const string &project_key, const string &experiment_file_path);
 
-  json FetchExperimentResult(FetchMode fetch_mode, const string &param_name,
-                             const json &default_value, FetchHandler success,
+  json FetchExperimentResult(FetchMode fetch_mode,
+                             const string &param_name,
+                             const json &default_value,
+                             const ABTestPropertiesNode &properties,
+                             FetchHandler handler,
                              int timeout_millisecond);
 
  private:
   bool Request(const string &param_name, const json &default_value,
-               int timeout_millisecond, FetchHandler handler);
+               int timeout_millisecond, FetchHandler handler, const string &custom_properties);
 
   // 初始化时异步获取实验结果
   bool AsyncGetDefaultResult();
@@ -263,6 +279,12 @@ class DefaultConsumer {
 
   // 匹配实验结果和默认值类型是否一致
   bool IsSameType(const string &type, const json &default_value);
+  
+  // 校验自定义属性的合法性
+  bool AssertProperties(const utils::ObjectNode &properties);
+
+  // 校验属性 key 的合法性
+  bool AssertKey(const string &type, const string &key);
 
   HttpRequest *request_;  // http request
 
@@ -281,6 +303,8 @@ class DefaultConsumer {
       triggered_experiments_;  // 当前用户已触发 $ABTestTrigger 事件的实验 ID
                                // 对照表
   mutex triggered_experiments_mtx_;  // triggered_experiments_ mutex lock
+  
+  mutex handle_response_mtx_;  // handle_response_ mutex lock
 
   int retry_count_;  // 初始化时请求实验错误重试次数
   vector<future<bool>>
@@ -296,35 +320,31 @@ class ABTestObserver : public UserAlterationObserver {
 };
 
 DefaultConsumer::DefaultConsumer(const string &server_url,
-                                 const string &project_key)
+                                 const string &project_key,
+                                 const string &experiment_file_path)
     : is_first_trigger_event_(true),
       project_key_(project_key),
+      file_path_(experiment_file_path),
       retry_count_(0),
       observer_(new ABTestObserver()),
       timer_(new Timer()),
       request_(new HttpRequest(server_url)) {
   // 观察者，SA SDK 的 distinct_id 发生变化时重新请求实验
   observer_->completion_ = [this]() {
-    LogInfo("current user id did alternated ！");
+    LogInfo("current user id did alternated !");
     this->distinct_id_ = sensors_analytics::Sdk::DistinctID();
     this->is_login_id_ = sensors_analytics::Sdk::IsLoginID();
     this->async_futures_.push_back(
         async(launch::async, &DefaultConsumer::Request, this, "", json(),
-              kDefaultTimeoutMilliseconds, FetchCompletionFunc));
+              kDefaultTimeoutMilliseconds, FetchCompletionFunc, ""));
   };
 
   // 定时器，每隔 10 分钟重新请求实验
   timer_->start(10, [this]() {
     this->async_futures_.push_back(
         async(launch::async, &DefaultConsumer::Request, this, "", json(),
-              kDefaultTimeoutMilliseconds, FetchCompletionFunc));
+              kDefaultTimeoutMilliseconds, FetchCompletionFunc, ""));
   });
-
-  vector<string> all_path =
-      Split(sensors_analytics::Sdk::StagingFilePath(), "/");
-  vector<string> prefix_path(all_path.begin(), all_path.end() - 1);
-  file_path_ = (prefix_path.size() > 0 ? Splice(prefix_path, "/") : ".") +
-               "/sensors_abtesting_experiments";
 
   distinct_id_ = sensors_analytics::Sdk::DistinctID();
   is_login_id_ = sensors_analytics::Sdk::IsLoginID();
@@ -341,7 +361,7 @@ bool DefaultConsumer::AsyncGetDefaultResult() {
   retry_count_++;
   future<bool> future =
       async(launch::async, &DefaultConsumer::Request, this, "", json(),
-            kDefaultTimeoutMilliseconds, FetchCompletionFunc);
+            kDefaultTimeoutMilliseconds, FetchCompletionFunc, "");
   if (!future.get() && retry_count_ < 3) {
     // 等待 30s 后进行重试操作
     std::this_thread::sleep_for(std::chrono::seconds(30));
@@ -401,7 +421,9 @@ void DefaultConsumer::UpdateExperiments(const string &original_data, bool is_req
 
 bool DefaultConsumer::Request(const string &param_name,
                               const json &default_value,
-                              int timeout_millisecond, FetchHandler handler) {
+                              int timeout_millisecond,
+                              FetchHandler handler,
+                              const string &custom_properties) {
   if (request_->server_url_.length() < 1) {
     return false;
   }
@@ -413,6 +435,21 @@ bool DefaultConsumer::Request(const string &param_name,
   request_body[(is_login_id_ ? "login_id" : "anonymous_id")] = distinct_id_;
   request_body["abtest_lib_version"] = ABTESTING_SDK_VERSION;
   request_body["platform"] = "cpp";
+  // 添加自定义属性，至少包含 "{}" 两个字符
+  if (custom_properties.length() > 2 && param_name.length() > 0) {
+      json custom_properties_json;
+      try {
+          custom_properties_json = json::parse(custom_properties);
+      } catch (exception &err) {
+        LogError("Exception when parse custom properties : " + (string)err.what());
+      }
+
+      if (!custom_properties_json.is_null()) {
+          request_body["custom_properties"] = custom_properties_json;
+          request_body["param_name"] = param_name;
+      }
+  }
+
   string body = request_body.dump();
 
   vector<HeaderFieldItem> headers = RequestHeaderFields(project_key_);
@@ -428,6 +465,9 @@ bool DefaultConsumer::Request(const string &param_name,
     request_->response_body_mtx_.lock();
     response_body = request_->response_body_;
     request_->response_body_mtx_.unlock();
+      
+    // 网络请求接口的返回是多线程，这里保证回调处理顺序
+    std::lock_guard<std::mutex> locker(handle_response_mtx_);
 
     json response = json::parse(response_body);
     if (response["status"] != "SUCCESS") {
@@ -438,7 +478,7 @@ bool DefaultConsumer::Request(const string &param_name,
     }
     // 当接口请求时的 distinct_id 和当前 distinct_id 不一致时，需要重新请求
     if (temp_distinct_id != distinct_id_) {
-      return Request(param_name, default_value, timeout_millisecond, handler);
+      return Request(param_name, default_value, timeout_millisecond, handler, custom_properties);
     }
 
     response[kCurrentUserIdKey] = distinct_id_;
@@ -474,25 +514,78 @@ inline void DefaultConsumer::DumpExperimentsToDisk(
   staging_ofs.close();
 }
 
+bool DefaultConsumer::AssertKey(const string &type, const string &key) {
+    size_t len = key.length();
+    if (len < 1 || len > 100) {
+        LogError("The " + type + " is empty or too long, max length is 100");
+        return false;
+    }
+    char ch = key[0];
+    if ((ch >= 'a' && ch <= 'z') || ch == '$' ||
+        (ch >= 'A' && ch <= 'Z') || ch == '_') {
+        for (size_t i = 1; i < len; ++i) {
+            ch = key[i];
+            if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') ||
+                (ch >= 'A' && ch <= 'Z') || ch == '$' || ch == '_') {
+                continue;
+            }
+            LogError("The " + type + " need to be a valid variable name.");
+            return false;
+        }
+        return true;
+    } else {
+        LogError("The " + type + " need to be a valid variable name.");
+        return false;
+    }
+}
+
+bool DefaultConsumer::AssertProperties(const utils::ObjectNode &properties) {
+    for (std::map<string, utils::ObjectNode::ValueNode>::const_iterator iter = properties.properties_map_.begin(); iter != properties.properties_map_.end(); ++iter) {
+        
+        if (!AssertKey("Property Key", iter->first)) {
+            return false;
+        }
+        
+        if (iter->second.node_type_ != utils::ObjectNode::STRING &&
+            iter->second.node_type_ != utils::ObjectNode::LIST &&
+            iter->second.node_type_ != utils::ObjectNode::NUMBER &&
+            iter->second.node_type_ != utils::ObjectNode::INT &&
+            iter->second.node_type_ != utils::ObjectNode::BOOL &&
+            iter->second.node_type_ != utils::ObjectNode::DATETIME) {
+            LogError("The property values must be STRING, LIST, NUMBER, BOOL or DATETIME. The value of property [" + iter->first + "] is invalid!");
+            return false;
+        }
+    }
+    return true;
+}
+
 json DefaultConsumer::FetchExperimentResult(FetchMode fetch_mode,
                                             const string &param_name,
                                             const json &default_value,
+                                            const ABTestPropertiesNode &properties,
                                             FetchHandler handler,
                                             int timeout_milliseconds) {
+  if (handler == NULL) {
+    LogError("fetch param_name [" + param_name + "] failed, handler must be exist!");
+    return default_value;
+  }
+
   if (param_name.length() < 1) {
     LogError("param_name: " + param_name +
              " error，param_name must be a valid string!");
+    handler(default_value);
     return default_value;
   }
 
   if (!(default_value.is_number_integer() || default_value.is_string() ||
         default_value.is_boolean() || default_value.is_object())) {
     LogError("fetch param_name [" + param_name + "] failed, default_value type must be int/string/bool/json !");
+    handler(default_value);
     return default_value;
   }
 
-  if (handler == NULL) {
-    LogError("fetch param_name [" + param_name + "] failed, handler must be exist!");
+  if (!AssertProperties(properties)) {
+    handler(default_value);
     return default_value;
   }
 
@@ -512,14 +605,30 @@ json DefaultConsumer::FetchExperimentResult(FetchMode fetch_mode,
       return result;
     }
     // 读取 Cache 失败后，尝试请求网络
+    string properties_json = "";
+    try {
+        properties_json = utils::ObjectNode::ToJson(properties);
+    } catch (exception &err) {
+        LogError("Exception when convert properties to json : " + (string)err.what());
+    }
+
+    const string custom_properties = properties_json;
     async_futures_.push_back(async(launch::async, &DefaultConsumer::Request,
                                    this, param_name, default_value,
-                                   timeout_milliseconds, handler));
+                                   timeout_milliseconds, handler, custom_properties));
   } else if (fetch_mode == kFetchModeAsync) {
     // 直接通过请求网络获取实验数据
+    string properties_json = "";
+    try {
+        properties_json = utils::ObjectNode::ToJson(properties);
+    } catch (exception &err) {
+        LogError("Exception when convert properties to json : " + (string)err.what());
+    }
+
+    const string custom_properties = properties_json;
     async_futures_.push_back(async(launch::async, &DefaultConsumer::Request,
                                    this, param_name, default_value,
-                                   timeout_milliseconds, handler));
+                                   timeout_milliseconds, handler, custom_properties));
   }
   return default_value;
 }
@@ -674,8 +783,14 @@ void DefaultConsumer::TrackTriggerEvent(const string &param_name) {
   experiments = experiments_;
   triggered_experiments_mtx_.unlock();
 
+  // 当前计划列表为空时，直接返回
   if (experiments.size() < 1) {
     return;
+  }
+
+  // 未查找到对应内容时，直接返回
+  if (experiments.find(param_name) == experiments.end()) {
+    return ;
   }
 
   ExperimentItem item = experiments.find(param_name)->second;
@@ -705,13 +820,7 @@ void DefaultConsumer::TrackTriggerEvent(const string &param_name) {
 
 Sdk *Sdk::instance_ = NULL;
 
-/// class Sdk
-#define RETURN_IF_ERROR(stmt) \
-  do {                        \
-    if (!stmt) return false;  \
-  } while (false)
-
-bool Sdk::Init(const string &server_url) {
+bool Sdk::Init(const string &server_url, const string &experiment_file_path) {
   if (!instance_) {
     UrlParser *parser = UrlParser::parseUrl(server_url);
     string project_key;
@@ -721,21 +830,22 @@ bool Sdk::Init(const string &server_url) {
 
     string url_without_query = UrlWithoutQuery(parser);
     if (url_without_query.length() < 1 || project_key.length() < 1) {
-      LogError("Initialize the SDK with the valid URL");
-      RETURN_IF_ERROR(true);
+      LogError("Initialize the SDK with the invalid server url !");
       return false;
+    }
+      
+    if (experiment_file_path.length() < 1) {
+        LogError("Initialize the SDK with the invalid experiment file path !");
+        return false;
     }
 
     string distinct_id = sensors_analytics::Sdk::DistinctID();
     if (distinct_id.length() < 1) {
-      LogError(
-          "You must initialize sensors analytics SDK before using A/B Testing "
-          "SDK !");
-      RETURN_IF_ERROR(true);
+      LogError("You must initialize sensors analytics SDK before using A/B Testing SDK !");
       return false;
     }
     LogInfo("Initialize SDK successfully.");
-    instance_ = new Sdk(url_without_query, project_key);
+    instance_ = new Sdk(url_without_query, project_key, experiment_file_path);
   }
   return true;
 }
@@ -743,33 +853,46 @@ bool Sdk::Init(const string &server_url) {
 json Sdk::FetchCacheABTest(const string &param_name,
                            const json &default_value) {
   if (instance_) {
-    return instance_->consumer_->FetchExperimentResult(
-        kFetchModeCache, param_name, default_value, FetchCompletionFunc,
-        kDefaultTimeoutMilliseconds);
+    ABTestPropertiesNode properties;
+    return instance_->consumer_->FetchExperimentResult(kFetchModeCache, param_name, default_value, properties, FetchCompletionFunc, kDefaultTimeoutMilliseconds);
   }
   return default_value;
 }
 
 void Sdk::FastFetchABTest(const string &param_name, const json &default_value,
                           FetchHandler handler, int timeout_milliseconds) {
-  if (instance_) {
-    instance_->consumer_->FetchExperimentResult(kFetchModeFast, param_name,
-                                                default_value, handler,
-                                                timeout_milliseconds);
-  }
+    ABTestPropertiesNode properties;
+    FastFetchABTest(param_name, default_value, properties, handler, timeout_milliseconds);
 }
 
 void Sdk::AsyncFetchABTest(const string &param_name, const json &default_value,
                            FetchHandler handler, int timeout_milliseconds) {
-  if (instance_) {
-    instance_->consumer_->FetchExperimentResult(kFetchModeAsync, param_name,
-                                                default_value, handler,
-                                                timeout_milliseconds);
-  }
+    ABTestPropertiesNode properties;
+    AsyncFetchABTest(param_name, default_value, properties, handler, timeout_milliseconds);
 }
 
-Sdk::Sdk(const string &server_url, const string &project_key)
-    : consumer_(new DefaultConsumer(server_url, project_key)) {
+void Sdk::AsyncFetchABTest(const string &param_name,
+                           const json &default_value,
+                           const ABTestPropertiesNode &properties,
+                           FetchHandler handler,
+                           int timeout_milliseconds) {
+    if (instance_) {
+      instance_->consumer_->FetchExperimentResult(kFetchModeAsync, param_name, default_value, properties, handler, timeout_milliseconds);
+    }
+}
+  
+void Sdk::FastFetchABTest(const string &param_name,
+                          const json &default_value,
+                          const ABTestPropertiesNode &properties,
+                          FetchHandler handler,
+                          int timeout_milliseconds) {
+    if (instance_) {
+        instance_->consumer_->FetchExperimentResult(kFetchModeFast, param_name, default_value, properties, handler, timeout_milliseconds);
+    }
+}
+
+Sdk::Sdk(const string &server_url, const string &project_key, const string &experiment_file_path)
+    : consumer_(new DefaultConsumer(server_url, project_key, experiment_file_path)) {
   sensors_analytics::Sdk::Attach(consumer_->observer_);
 }
 
