@@ -382,7 +382,7 @@ void DefaultConsumer::UpdateExperiments(const string &original_data, bool is_req
     LogError("Exception when Update Experiments : " + (string)err.what());
   }
 
-  if (object.is_null()) {
+  if (object.is_null() || !object.is_object()) {
     return;
   }
 

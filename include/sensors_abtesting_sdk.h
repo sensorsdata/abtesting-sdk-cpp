@@ -24,7 +24,7 @@
 #include "sensors_json.hpp"
 #include "sensors_analytics_sdk.h"
 
-#define ABTESTING_SDK_VERSION "0.0.2"
+#define ABTESTING_SDK_VERSION "0.0.3"
 #define ABTESTING_SDK_NAME "Sensors A/B Testing CPP SDK"
 #define ABTESTING_SDK_FULL_NAME ABTESTING_SDK_NAME " " ABTESTING_SDK_VERSION
 
