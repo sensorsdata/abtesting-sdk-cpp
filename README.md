@@ -10,7 +10,7 @@
 
 ## SDK 简介
 
-A/B Testing SDK 是一款用于 A/B 测试的 SDK。
+A/B Testing SDK 是一款用于 A/B 测试的 C++ 端 SDK。
 
 ## 神策埋点 SDK 官网
 如需了解神策埋点 SDK 的更多商业授权信息，请访问[神策埋点 SDK 官网](https://jssdk.debugbox.sensorsdata.cn/)获取更多详细信息。
