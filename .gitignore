@@ -30,3 +30,29 @@
 *.exe
 *.out
 *.app
+
+# GitLab 文档和 demo 目录
+/Docs/
+/examples/
+
+# GitLab 本地回归与验收记录
+/tests/example_local_test.py
+/tests/测试说明.md
+
+# 测试协议样本和运行数据
+/tests/**/*.json
+/tests/**/*.jsonc
+/tests/**/*.jsonl
+/tests/**/*.ndjson
+
+# 本机开发和运行产物
+/AGENTS.md
+/build/
+.DS_Store
+__pycache__/
+*.pyc
+example.log
+analytics_events.jsonl
+experiments.json
+experiments.json.hit_records.json
+experiments.json.track_config.json

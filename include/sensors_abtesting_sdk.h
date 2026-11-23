@@ -24,7 +24,7 @@
 #include "sensors_json.hpp"
 #include "sensors_analytics_sdk.h"
 
-#define ABTESTING_SDK_VERSION "0.0.3"
+#define ABTESTING_SDK_VERSION "1.0.0"
 #define ABTESTING_SDK_NAME "Sensors A/B Testing CPP SDK"
 #define ABTESTING_SDK_FULL_NAME ABTESTING_SDK_NAME " " ABTESTING_SDK_VERSION
 
@@ -51,10 +51,11 @@ class Sdk {
  public:
   // 初始化 A/B Testing SDK
   // server_url: 获取 A/B Testing 试验地址
-  // experiment_file_path: 保存试验地址的文件路径
+  // experiment_file_path: 分流结果缓存路径
+  // 命中记录和事件配置独立保存在该路径 + ".hit_records.json" / ".track_config.json"
   static bool Init(const string &server_url, const string &experiment_file_path);
 
-  // 总是从缓存获取试验
+  // 总是从缓存获取试验；业务查询时自动处理进组/出组及命中去重
   // param_name: 试验参数名
   // default_value: 默认结果
   static json FetchCacheABTest(const string &param_name,

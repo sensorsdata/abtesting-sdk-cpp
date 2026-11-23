@@ -17,17 +17,24 @@
 #include "sensors_abtesting_sdk.h"
 
 #include <algorithm>
-#include <atomic>
 #include <condition_variable>
+#include <cerrno>
+#include <cstdio>
+#include <cstdint>
+#include <cmath>
 #include <fstream>
 #include <functional>
 #include <future>
 #include <iostream>
 #include <iterator>
+#include <limits>
 #include <mutex>
-#include <queue>
+#include <set>
 #include <sstream>
 #include <thread>
+#include <tuple>
+#include <stdexcept>
+#include <utility>
 
 #include "sensors_json.hpp"
 #include "sensors_network.h"
@@ -45,36 +52,73 @@ const string kCurrentUserIdKey = "user_id";
 const int kDefaultTimeoutMilliseconds = 30 * 1000;
 enum FetchMode { kFetchModeCache, kFetchModeAsync, kFetchModeFast };
 
-typedef struct {
+struct UserContext {
+  string distinct_id;
+  bool is_login_id;
+  unsigned long long generation;
+};
+
+struct ExperimentItemVar {
   string name;
   string type;
   string value;
+};
 
-} ExperimentItemVar;
-
-typedef struct {
+struct ExperimentItem {
   string experiment_id;
   string experiment_group_id;
-  bool is_control_group;
-  bool is_white_list;
+  string experiment_result_id;
+  string subject_name;
+  string subject_id;
+  bool is_white_list = false;
   vector<ExperimentItemVar> variables;
+  json extended_info;
+};
 
-} ExperimentItem;
+struct HitRecord {
+  string experiment_id;
+  string experiment_group_id;
+  string experiment_result_id;
+};
 
-// nlohmann/json.hpp 重载函数
-void from_json(const json &j, ExperimentItemVar &var) {
-  j.at("name").get_to(var.name);
-  j.at("type").get_to(var.type);
-  j.at("value").get_to(var.value);
+// legacy 与服务端主体分开，避免字符串拼接碰撞及登录/匿名身份混用。
+using SubjectKey = tuple<bool, string, string, bool>;
+using HitRecords = map<SubjectKey, map<string, HitRecord>>;
+
+struct TrackConfig {
+  bool trigger_switch = true;
+  vector<string> extended_keys = {
+      "abtest_experiment_version", "abtest_experiment_result_id"};
+};
+
+// ID 只接受字符串或整数，不经浮点数转换，避免大 ID 丢失精度。
+string ReadId(const json &object, const string &key, bool required = true) {
+  const auto found = object.find(key);
+  if (found == object.end() && !required) {
+    return "";
+  }
+  if (found == object.end()) {
+    throw invalid_argument("missing ID: " + key);
+  }
+  string value;
+  if (found->is_string()) {
+    value = found->get<string>();
+  } else if (found->is_number_integer()) {
+    value = found->dump();
+  } else {
+    throw invalid_argument("invalid ID type: " + key);
+  }
+  if (value.empty()) {
+    throw invalid_argument("empty ID: " + key);
+  }
+  return value;
 }
 
-// nlohmann/json.hpp 重载函数
-void from_json(const json &j, ExperimentItem &item) {
-  j.at("abtest_experiment_id").get_to(item.experiment_id);
-  j.at("abtest_experiment_group_id").get_to(item.experiment_group_id);
-  j.at("is_control_group").get_to(item.is_control_group);
-  j.at("is_white_list").get_to(item.is_white_list);
-  j.at("variables").get_to(item.variables);
+SubjectKey HitSubject(const ExperimentItem &item, const UserContext &context) {
+  if (item.subject_name.empty()) {
+    return make_tuple(true, "", context.distinct_id, context.is_login_id);
+  }
+  return make_tuple(false, item.subject_name, item.subject_id, false);
 }
 
 // 添加 http header 内容
@@ -88,7 +132,7 @@ vector<HeaderFieldItem> RequestHeaderFields(const string &project_key) {
 }
 
 // default fetch completion function
-void FetchCompletionFunc(const json &result) {
+void FetchCompletionFunc(const json &) {
   // nothing to do
 }
 
@@ -131,47 +175,56 @@ void LogError(T const message) {
   cerr << LogMessagePrefix() << message << endl;
 }
 
+// 客户回调独立执行；回调抛异常不能被误判为解析失败并再次回调。
+void CompleteFetch(FetchHandler handler, const json &result) {
+  if (!handler) {
+    return;
+  }
+  try {
+    handler(result);
+  } catch (const exception &err) {
+    LogError("fetch handler failed: " + string(err.what()));
+  } catch (...) {
+    LogError("fetch handler failed with an unknown exception");
+  }
+}
+
 };  // namespace abtesting_utils
 
 using namespace abtesting_utils;
 
 class Timer {
  public:
-  Timer() {
-    expired = true;
-    tryToExpire = false;
+  void start(int minute, function<void()> task) {
+    worker_ = thread([this, minute, task]() {
+      unique_lock<mutex> lock(mtx_);
+      while (!cv_.wait_for(lock, chrono::minutes(minute),
+                           [this]() { return stopped_; })) {
+        lock.unlock();
+        task();
+        lock.lock();
+      }
+    });
   }
 
-  void start(int minute, std::function<void()> task) {
-    if (expired == false) return;
-    expired = false;
-    std::thread([this, minute, task]() {
-      while (!tryToExpire) {
-        // sleep every interval and do the task again and again until times up
-        std::this_thread::sleep_for(std::chrono::minutes(minute));
-        task();  // call this function every interval milliseconds.
-      }
-      // thread
-      std::lock_guard<std::mutex> locker(mut);
-      expired = true;
-      cv.notify_one();
-    }).detach();
-  }
   void stop() {
-    // do not stop again
-    if (expired) return;
-    if (tryToExpire) return;
-    tryToExpire = true;
-    std::unique_lock<std::mutex> locker(mut);
-    cv.wait(locker, [this] { return expired == true; });
-    if (expired == true) tryToExpire = false;
+    {
+      lock_guard<mutex> lock(mtx_);
+      stopped_ = true;
+    }
+    cv_.notify_all();
+    if (worker_.joinable()) {
+      worker_.join();
+    }
   }
+
+  ~Timer() { stop(); }
 
  private:
-  condition_variable cv;
-  mutex mut;
-  atomic<bool> expired;      // timer stop status
-  atomic<bool> tryToExpire;  // timer is in stop process.
+  bool stopped_ = false;
+  condition_variable cv_;
+  mutex mtx_;
+  thread worker_;
 };
 
 class HttpRequest {
@@ -181,10 +234,8 @@ class HttpRequest {
       const vector<HeaderFieldItem> &http_headers = vector<HeaderFieldItem>());
 
   bool Request(const string &data, const vector<HeaderFieldItem> &http_headers,
-               int timeout_second = 30);
+               string &response_body, int timeout_second = 30);
   string server_url_;
-  string response_body_;
-  mutex response_body_mtx_;
 
  private:
   vector<pair<string, string>> http_headers_;
@@ -196,7 +247,7 @@ HttpRequest::HttpRequest(const string &server_url,
 
 bool HttpRequest::Request(const string &data,
                           const vector<HeaderFieldItem> &http_headers,
-                          int timeout_second) {
+                          string &response_body, int timeout_second) {
   // 超时时间最小为 1s
   int timeout = timeout_second < 1 ? 1 : timeout_second;
   Response response = Post(server_url_, data, timeout, http_headers);
@@ -207,9 +258,7 @@ bool HttpRequest::Request(const string &data,
   if (response.body_.length() < 1) {
     return false;
   }
-  response_body_mtx_.lock();
-  response_body_ = response.body_;
-  response_body_mtx_.unlock();
+  response_body = response.body_;
   return true;
 }
 
@@ -225,95 +274,83 @@ void ABTestPropertiesNode::SetList(const string &property_name, const std::vecto
     }
 }
 
-void ABTestPropertiesNode::SetObject(const string &property_name, const ObjectNode &value) {}
+void ABTestPropertiesNode::SetObject(const string &, const ObjectNode &) {}
 
 class ABTestObserver;
 class DefaultConsumer {
  public:
   ABTestObserver *observer_;
 
-  DefaultConsumer(const string &server_url, const string &project_key, const string &experiment_file_path);
+  // 内部开关用于本地确定性测试；客户 Init 仍启动初始化拉取和定时刷新。
+  DefaultConsumer(const string &server_url, const string &project_key,
+                  const string &experiment_file_path, bool start_background = true);
+  ~DefaultConsumer();
 
-  json FetchExperimentResult(FetchMode fetch_mode,
-                             const string &param_name,
+  json FetchExperimentResult(FetchMode fetch_mode, const string &param_name,
                              const json &default_value,
                              const ABTestPropertiesNode &properties,
-                             FetchHandler handler,
-                             int timeout_millisecond);
+                             FetchHandler handler, int timeout_millisecond);
 
  private:
   bool Request(const string &param_name, const json &default_value,
-               int timeout_millisecond, FetchHandler handler, const string &custom_properties);
-
-  // 初始化时异步获取实验结果
+               int timeout_millisecond, FetchHandler handler,
+               const string &custom_properties);
   bool AsyncGetDefaultResult();
+  void RestoreFromDisk();
+  void RestoreHitRecords(const json &records);
+  // 调用方持有 handle_response_mtx_，复制最新状态后写盘。
+  void PersistExperiments();
+  bool PersistHitRecords();
+  bool PersistTrackConfig();
+  bool UpdateExperiments(const json &response, const UserContext &context,
+                         bool update_config = true);
+  bool ParseExperiment(const json &value, bool is_out, ExperimentItem *item);
+  TrackConfig ParseTrackConfig(const json &response, bool *is_remote = NULL);
 
-  // 从本地磁盘中加载缓存实验结果
-  string LoadExperimentsFromDisk();
-
-  // 将实验结果缓存至本地磁盘中
-  void DumpExperimentsToDisk(const string &original_data);
-
-  // 更新内存中实验结果列表
-  void ClearExperimentsFromDisk();
-
-  // 更新内存中实验结果列表
-  void UpdateExperiments(const string &original_data, bool is_request);
-
-  // 触发 $ABTestTrigger 事件
-  void TrackTriggerEvent(const string &param_name);
-
-  // 查找指定实验结果
-  json FindExperimentResult(const string &param_name,
-                            const json &default_value);
-
-  // 处理请求成功后结果回调
+  // 命中 mutex 覆盖查询、最后记录更新和 Track，handler 在所有锁外。
+  json QueryAndTrack(const string &param_name, const json &default_value,
+                     const UserContext *request_context = NULL);
+  void TrackTriggerEvent(const ExperimentItem &item, const UserContext &context,
+                         const TrackConfig &config);
+  json ConvertResult(const ExperimentItem &item, const string &param_name,
+                     const json &default_value);
+  void AddExtendedProperties(const ExperimentItem &item, const TrackConfig &config,
+                             PropertiesNode *properties);
   void HandleCompletion(const string &param_name, const json &default_value,
-                        FetchHandler handler);
-
-  // 当前实验是否已触发过 $ABTestTrigger 事件
-  bool IsTriggeredForExperiment(const string &experiment_id);
-
-  // 标记实验已触发 $ABTestTrigger 事件
-  void AddTriggeredExperiment(const string &experiment_id);
-
-  // 匹配实验结果和默认值类型是否一致
+                        FetchHandler handler, const UserContext &context);
+  UserContext CurrentUserContext();
+  void StoreAsyncFuture(future<bool> task);
   bool IsSameType(const string &type, const json &default_value);
-  
-  // 校验自定义属性的合法性
   bool AssertProperties(const utils::ObjectNode &properties);
-
-  // 校验属性 key 的合法性
   bool AssertKey(const string &type, const string &key);
 
-  HttpRequest *request_;  // http request
-
+  HttpRequest *request_;
   Timer *timer_;
-  string file_path_;  // experiments cache file path
-  map<string, ExperimentItem>
-      experiments_;        // parse all experiments from original data
-  mutex experiments_mtx_;  // experiments_ mutex lock
-
-  string distinct_id_;  // user unique id from SA SDK
-  bool is_login_id_;    // distinct_id is login_id or not
-  string project_key_;  // A/B testing SDK reqeust header key
-
-  bool is_first_trigger_event_;  // 是否为触发的第一个 $ABTestTrigger 事件
-  vector<pair<string, vector<string>>>
-      triggered_experiments_;  // 当前用户已触发 $ABTestTrigger 事件的实验 ID
-                               // 对照表
-  mutex triggered_experiments_mtx_;  // triggered_experiments_ mutex lock
-  
-  mutex handle_response_mtx_;  // handle_response_ mutex lock
-
-  int retry_count_;  // 初始化时请求实验错误重试次数
-  vector<future<bool>>
-      async_futures_;  // 异步操作结果对象列表，保证异步操作不会被释放
+  string file_path_;
+  string hit_file_path_;
+  string config_file_path_;
+  map<string, ExperimentItem> experiments_;
+  map<string, vector<ExperimentItem>> out_experiments_;
+  json cached_response_;
+  TrackConfig track_config_;
+  json cached_track_config_;
+  HitRecords hit_records_;
+  mutex experiments_mtx_;  // 保护缓存、身份、事件配置及命中记录
+  string distinct_id_;
+  bool is_login_id_;
+  unsigned long long user_generation_;
+  string project_key_;
+  bool is_first_trigger_event_;
+  bool start_background_;
+  mutex hit_mtx_;  // 串行查询和命中事件；不持此锁调用客户 handler
+  mutex handle_response_mtx_;  // 串行响应提交和文件写入
+  vector<future<bool>> async_futures_;
+  mutex async_futures_mtx_;
 };
 
 typedef std::function<void()> ObserverCompletion;
 
-class ABTestObserver : public UserAlterationObserver {
+class ABTestObserver final : public UserAlterationObserver {
  public:
   ObserverCompletion completion_;
   void Update() { completion_(); }
@@ -321,102 +358,248 @@ class ABTestObserver : public UserAlterationObserver {
 
 DefaultConsumer::DefaultConsumer(const string &server_url,
                                  const string &project_key,
-                                 const string &experiment_file_path)
-    : is_first_trigger_event_(true),
-      project_key_(project_key),
-      file_path_(experiment_file_path),
-      retry_count_(0),
-      observer_(new ABTestObserver()),
+                                 const string &experiment_file_path,
+                                 bool start_background)
+    : observer_(new ABTestObserver()),
+      request_(new HttpRequest(server_url)),
       timer_(new Timer()),
-      request_(new HttpRequest(server_url)) {
-  // 观察者，SA SDK 的 distinct_id 发生变化时重新请求实验
+      file_path_(experiment_file_path),
+      hit_file_path_(experiment_file_path + ".hit_records.json"),
+      config_file_path_(experiment_file_path + ".track_config.json"),
+      distinct_id_(sensors_analytics::Sdk::DistinctID()),
+      is_login_id_(sensors_analytics::Sdk::IsLoginID()),
+      user_generation_(0),
+      project_key_(project_key),
+      is_first_trigger_event_(true),
+      start_background_(start_background) {
   observer_->completion_ = [this]() {
-    LogInfo("current user id did alternated !");
-    this->distinct_id_ = sensors_analytics::Sdk::DistinctID();
-    this->is_login_id_ = sensors_analytics::Sdk::IsLoginID();
-    this->async_futures_.push_back(
-        async(launch::async, &DefaultConsumer::Request, this, "", json(),
-              kDefaultTimeoutMilliseconds, FetchCompletionFunc, ""));
+    const string distinct_id = sensors_analytics::Sdk::DistinctID();
+    const bool is_login_id = sensors_analytics::Sdk::IsLoginID();
+    {
+      lock_guard<mutex> response_lock(handle_response_mtx_);
+      {
+        lock_guard<mutex> state_lock(experiments_mtx_);
+        distinct_id_ = distinct_id;
+        is_login_id_ = is_login_id;
+        ++user_generation_;
+        experiments_.clear();
+        out_experiments_.clear();
+        cached_response_ = json();
+      }
+      // 与 iOS 一致：用户切换仅删除分流缓存，保留命中历史和事件配置。
+      if (std::remove(file_path_.c_str()) != 0 && errno != ENOENT) {
+        LogError("cannot remove experiment cache: " + file_path_);
+      }
+    }
+    if (start_background_) {
+      StoreAsyncFuture(async(launch::async, &DefaultConsumer::Request, this,
+                             "", json(), kDefaultTimeoutMilliseconds,
+                             FetchCompletionFunc, ""));
+    }
   };
 
-  // 定时器，每隔 10 分钟重新请求实验
-  timer_->start(10, [this]() {
-    this->async_futures_.push_back(
-        async(launch::async, &DefaultConsumer::Request, this, "", json(),
-              kDefaultTimeoutMilliseconds, FetchCompletionFunc, ""));
-  });
+  RestoreFromDisk();
+  if (start_background_) {
+    timer_->start(10, [this]() {
+      StoreAsyncFuture(async(launch::async, &DefaultConsumer::Request, this,
+                             "", json(), kDefaultTimeoutMilliseconds,
+                             FetchCompletionFunc, ""));
+    });
+    StoreAsyncFuture(async(launch::async, &DefaultConsumer::AsyncGetDefaultResult,
+                           this));
+  }
+}
 
-  distinct_id_ = sensors_analytics::Sdk::DistinctID();
-  is_login_id_ = sensors_analytics::Sdk::IsLoginID();
+DefaultConsumer::~DefaultConsumer() {
+  timer_->stop();
+  vector<future<bool>> tasks;
+  {
+    lock_guard<mutex> lock(async_futures_mtx_);
+    tasks.swap(async_futures_);
+  }
+  for (auto &task : tasks) {
+    task.wait();
+  }
+  delete timer_;
+  delete request_;
+  delete observer_;
+}
 
-  string original_data = LoadExperimentsFromDisk();
-  UpdateExperiments(original_data, false);
+UserContext DefaultConsumer::CurrentUserContext() {
+  lock_guard<mutex> lock(experiments_mtx_);
+  return UserContext{distinct_id_, is_login_id_, user_generation_};
+}
 
-  // 异步处理请求失败重试场景
-  async_futures_.push_back(
-      async(launch::async, &DefaultConsumer::AsyncGetDefaultResult, this));
+void DefaultConsumer::StoreAsyncFuture(future<bool> task) {
+  lock_guard<mutex> lock(async_futures_mtx_);
+  async_futures_.erase(remove_if(async_futures_.begin(), async_futures_.end(),
+      [](future<bool> &value) {
+        return value.wait_for(chrono::seconds(0)) == future_status::ready;
+      }), async_futures_.end());
+  async_futures_.push_back(std::move(task));
 }
 
 bool DefaultConsumer::AsyncGetDefaultResult() {
-  retry_count_++;
-  future<bool> future =
-      async(launch::async, &DefaultConsumer::Request, this, "", json(),
-            kDefaultTimeoutMilliseconds, FetchCompletionFunc, "");
-  if (!future.get() && retry_count_ < 3) {
-    // 等待 30s 后进行重试操作
-    std::this_thread::sleep_for(std::chrono::seconds(30));
-    AsyncGetDefaultResult();
+  for (int attempt = 0; attempt < 3; ++attempt) {
+    if (Request("", json(), kDefaultTimeoutMilliseconds, FetchCompletionFunc, "")) {
+      return true;
+    }
+    if (attempt < 2) {
+      this_thread::sleep_for(chrono::seconds(30));
+    }
+  }
+  return false;
+}
+
+bool DefaultConsumer::ParseExperiment(const json &value, bool is_out,
+                                      ExperimentItem *item) {
+  if (!value.is_object()) {
+    throw invalid_argument("experiment must be an object");
+  }
+  if (value.count("experiment_type") && value.at("experiment_type") != "CODE") {
+    return false;  // Native SDK 不索引可视化等非 CODE 试验。
+  }
+  const bool has_name = value.count("subject_name") != 0;
+  const bool has_id = value.count("subject_id") != 0;
+  if (has_name || has_id) {
+    if (!has_name || !has_id || !value.at("subject_name").is_string() ||
+        !value.at("subject_id").is_string() ||
+        value.at("subject_name").get<string>().empty() ||
+        value.at("subject_id").get<string>().empty()) {
+      LogError("skip experiment with incomplete subject fields");
+      return false;
+    }
+    item->subject_name = value.at("subject_name").get<string>();
+    item->subject_id = value.at("subject_id").get<string>();
+  }
+  item->experiment_id = ReadId(value, "abtest_experiment_id");
+  item->experiment_group_id = ReadId(value, "abtest_experiment_group_id", !is_out);
+  item->experiment_result_id = ReadId(value, "abtest_experiment_result_id", is_out);
+  if ((is_out && item->experiment_result_id != "-1") ||
+      (!is_out && item->experiment_result_id == "-1")) {
+    throw invalid_argument("invalid experiment result ID for results/out_list");
+  }
+  item->is_white_list = value.value("is_white_list", false);
+  item->extended_info = value;
+  item->extended_info["abtest_experiment_id"] = item->experiment_id;
+  if (!item->experiment_group_id.empty()) {
+    item->extended_info["abtest_experiment_group_id"] = item->experiment_group_id;
+  }
+  if (!item->experiment_result_id.empty()) {
+    item->extended_info["abtest_experiment_result_id"] = item->experiment_result_id;
+  }
+  const json &variables = value.at("variables");
+  if (!variables.is_array()) {
+    throw invalid_argument("variables must be an array");
+  }
+  for (const auto &variable : variables) {
+    ExperimentItemVar var;
+    var.name = variable.at("name").get<string>();
+    if (var.name.empty()) {
+      continue;
+    }
+    if (!is_out) {
+      var.type = variable.at("type").get<string>();
+      var.value = variable.at("value").get<string>();
+    }
+    item->variables.push_back(var);
   }
   return true;
 }
 
-void DefaultConsumer::UpdateExperiments(const string &original_data, bool is_request) {
-  if (original_data.length() < 1) {
-    return;
+TrackConfig DefaultConsumer::ParseTrackConfig(const json &response, bool *is_remote) {
+  if (is_remote) *is_remote = false;
+  TrackConfig config;
+  const auto found = response.find("track_config");
+  if (found == response.end() || (found->is_object() && found->empty())) {
+    return config;
   }
-
-  json object;
   try {
-    object = json::parse(original_data);
-  } catch (exception &err) {
-    LogError("Exception when Update Experiments : " + (string)err.what());
-  }
-
-  if (object.is_null() || !object.is_object()) {
-    return;
-  }
-
-  if (object[kCurrentUserIdKey] != distinct_id_) {
-    LogInfo("clear experiments from disk because of current user changed!");
-    ClearExperimentsFromDisk();
-    return;
-  }
-
-  vector<ExperimentItem> results =
-      object["results"].get<vector<ExperimentItem>>();
-
-  map<string, ExperimentItem> experiments;
-  for (vector<ExperimentItem>::const_iterator item = results.begin();
-       item != results.end(); ++item) {
-    vector<ExperimentItemVar> variables = item->variables;
-    for (vector<ExperimentItemVar>::const_iterator var = variables.begin();
-         var != variables.end(); ++var) {
-      // 插入内容时若对应字段名已存在，不会添加覆盖。
-      experiments.insert(pair<string, ExperimentItem>(var->name, *item));
+    if (!found->is_object()) {
+      throw invalid_argument("track_config must be an object");
     }
+    config.trigger_switch = found->value("trigger_switch", false);
+    config.extended_keys.clear();
+    if (found->count("trigger_content_ext")) {
+      const json &keys = found->at("trigger_content_ext");
+      if (!keys.is_array()) {
+        throw invalid_argument("trigger_content_ext must be an array");
+      }
+      for (const auto &key : keys) {
+        config.extended_keys.push_back(key.get<string>());
+      }
+    }
+    if (found->value("property_set_switch", false)) {
+      LogInfo("property_set_switch is not supported; using trigger events only");
+    }
+    if (is_remote) *is_remote = true;
+    return config;
+  } catch (const exception &err) {
+    LogError("invalid track_config, using defaults: " + string(err.what()));
+    return TrackConfig();
   }
+}
 
-  if (experiments.size() < 1) {
-    return;
+bool DefaultConsumer::UpdateExperiments(const json &response,
+                                        const UserContext &context,
+                                        bool update_config) {
+  try {
+    if (!response.is_object() || response.at("status") != "SUCCESS" ||
+        !response.at("results").is_array()) {
+      return false;
+    }
+    map<string, ExperimentItem> experiments;
+    map<string, vector<ExperimentItem>> out_experiments;
+    set<string> active_experiments;
+    for (const auto &value : response.at("results")) {
+      ExperimentItem item;
+      if (!ParseExperiment(value, false, &item)) {
+        continue;
+      }
+      active_experiments.insert(item.experiment_id);
+      for (const auto &var : item.variables) {
+        experiments.insert(make_pair(var.name, item));
+      }
+    }
+    if (response.count("out_list")) {
+      if (!response.at("out_list").is_array()) {
+        throw invalid_argument("out_list must be an array");
+      }
+      for (const auto &value : response.at("out_list")) {
+        ExperimentItem item;
+        if (!ParseExperiment(value, true, &item)) {
+          continue;
+        }
+        if (active_experiments.count(item.experiment_id)) {
+          LogError("skip out_list entry conflicting with results");
+          continue;
+        }
+        for (const auto &var : item.variables) {
+          out_experiments[var.name].push_back(item);
+        }
+      }
+    }
+    bool is_remote = false;
+    TrackConfig config;
+    if (update_config) config = ParseTrackConfig(response, &is_remote);
+    lock_guard<mutex> lock(experiments_mtx_);
+    if (context.generation != user_generation_) {
+      return false;
+    }
+    experiments_.swap(experiments);
+    out_experiments_.swap(out_experiments);
+    if (update_config) {
+      track_config_ = config;
+      cached_track_config_ = is_remote ? json{{"track_config", response.at("track_config")}} : json();
+    }
+    cached_response_ = response;
+    cached_response_.erase("hit_records");  // 后端不能覆盖本地命中历史。
+    cached_response_.erase("track_config");  // 事件配置单独存储和恢复。
+    return true;
+  } catch (const exception &err) {
+    LogError("invalid experiment response: " + string(err.what()));
+    return false;
   }
-
-  string prefix = is_request ? "request experiments success!\n" : "load experiments success from disk!\n";
-  LogInfo(prefix + original_data);
-
-  // 互斥锁保证多线程读写安全
-  experiments_mtx_.lock();
-  experiments_ = experiments;
-  experiments_mtx_.unlock();
 }
 
 bool DefaultConsumer::Request(const string &param_name,
@@ -424,94 +607,266 @@ bool DefaultConsumer::Request(const string &param_name,
                               int timeout_millisecond,
                               FetchHandler handler,
                               const string &custom_properties) {
-  if (request_->server_url_.length() < 1) {
+  const UserContext context = CurrentUserContext();
+  bool success = false;
+  try {
+    if (!request_->server_url_.empty()) {
+      json request_body;
+      request_body[context.is_login_id ? "login_id" : "anonymous_id"] =
+          context.distinct_id;
+      request_body["abtest_lib_version"] = ABTESTING_SDK_VERSION;
+      request_body["platform"] = "cpp";
+      if (custom_properties.length() > 2 && !param_name.empty()) {
+        json properties = json::parse(custom_properties);
+        if (!properties.is_null()) {
+          request_body["custom_properties"] = properties;
+          request_body["param_name"] = param_name;
+        }
+      }
+      string response_body;  // 响应只属于本次请求，不通过共享缓冲传递。
+      const vector<HeaderFieldItem> headers = RequestHeaderFields(project_key_);
+      if (request_->Request(request_body.dump(), headers, response_body,
+                            timeout_millisecond / 1000)) {
+        json response = json::parse(response_body);
+        if (response.is_object() && response.value("status", string()) == "SUCCESS") {
+          lock_guard<mutex> lock(handle_response_mtx_);
+          const UserContext current = CurrentUserContext();
+          if (context.generation == current.generation) {
+            response[kCurrentUserIdKey] = context.distinct_id;
+            response["is_login_id"] = context.is_login_id;
+            if (UpdateExperiments(response, context)) {
+              PersistExperiments();
+              PersistTrackConfig();
+              success = true;
+            }
+          }
+        } else {
+          LogError("request experiments failed: " + response_body);
+        }
+      }
+    }
+  } catch (const exception &err) {
+    LogError("Exception when Request: " + string(err.what()));
+  }
+  // 客户回调与 Track 不在响应锁内；失败、解析异常、身份过期均正常完成。
+  if (!param_name.empty()) {
+    if (success) {
+      HandleCompletion(param_name, default_value, handler, context);
+    } else {
+      CompleteFetch(handler, default_value);
+    }
+  }
+  return success;
+}
+
+void DefaultConsumer::RestoreHitRecords(const json &records) {
+  if (!records.is_array()) {
+    LogError("ignore invalid hit_records");
+    return;
+  }
+  for (const auto &group : records) {
+    try {
+      SubjectKey key;
+      if (group.count("legacy_user")) {
+        const auto &user = group.at("legacy_user");
+        if (group.count("subject_name") || group.count("subject_id")) {
+          throw invalid_argument("mixed legacy and subject hit group");
+        }
+        const string id = user.at("distinct_id").get<string>();
+        if (id.empty()) {
+          throw invalid_argument("empty legacy distinct_id");
+        }
+        key = make_tuple(true, "", id, user.at("is_login_id").get<bool>());
+      } else {
+        const string name = group.at("subject_name").get<string>();
+        const string id = group.at("subject_id").get<string>();
+        if (name.empty() || id.empty()) {
+          throw invalid_argument("empty hit subject");
+        }
+        key = make_tuple(false, name, id, false);
+      }
+      const json &results = group.at("results");
+      if (!results.is_object()) {
+        throw invalid_argument("hit results must be an object");
+      }
+      for (auto it = results.begin(); it != results.end(); ++it) {
+        try {
+          HitRecord record;
+          record.experiment_id = ReadId(it.value(), "abtest_experiment_id");
+          record.experiment_group_id = ReadId(it.value(), "abtest_experiment_group_id", false);
+          record.experiment_result_id = ReadId(it.value(), "abtest_experiment_result_id", false);
+          if (record.experiment_id != it.key() ||
+              (record.experiment_group_id.empty() && record.experiment_result_id.empty())) {
+            throw invalid_argument("invalid hit record");
+          }
+          hit_records_[key][record.experiment_id] = record;
+        } catch (const exception &err) {
+          LogError("ignore invalid hit record: " + string(err.what()));
+        }
+      }
+    } catch (const exception &err) {
+      LogError("ignore invalid hit group: " + string(err.what()));
+    }
+  }
+}
+
+void DefaultConsumer::RestoreFromDisk() {
+  // 三类缓存独立恢复；结果文件损坏不影响历史和事件配置。
+  ifstream config_file(config_file_path_.c_str());
+  const bool has_config_file = config_file.is_open();
+  if (has_config_file) {
+    try {
+      const string data((istreambuf_iterator<char>(config_file)), istreambuf_iterator<char>());
+      bool is_remote = false;
+      const json saved = json::parse(data);
+      track_config_ = ParseTrackConfig(saved, &is_remote);
+      if (is_remote) cached_track_config_ = saved;
+    } catch (const exception &err) {
+      LogError("cannot restore track config: " + string(err.what()));
+    }
+    config_file.close();
+  }
+  ifstream hit_file(hit_file_path_.c_str());
+  const bool has_hit_file = hit_file.is_open();
+  if (has_hit_file) {
+    try {
+      const string data((istreambuf_iterator<char>(hit_file)), istreambuf_iterator<char>());
+      RestoreHitRecords(json::parse(data).at("hit_records"));
+    } catch (const exception &err) {
+      LogError("cannot restore hit records: " + string(err.what()));
+    }
+  }
+  ifstream file(file_path_.c_str());
+  if (!file) {
+    return;
+  }
+  const string data((istreambuf_iterator<char>(file)), istreambuf_iterator<char>());
+  file.close();
+  if (data.empty()) {
+    return;
+  }
+  try {
+    json response = json::parse(data);
+    if (!response.is_object()) {
+      return;
+    }
+    const bool needs_cleanup = response.count("hit_records") || response.count("track_config");
+    bool migration_ok = true;
+    if (!has_hit_file && response.count("hit_records") && response.at("hit_records").is_array()) {
+      // 兼容开发期的合并文件，仅迁移一次；独立文件存在时始终以其为准。
+      RestoreHitRecords(response.at("hit_records"));
+      migration_ok = PersistHitRecords();
+    }
+    if (!has_config_file && response.count("track_config")) {
+      bool is_remote = false;
+      track_config_ = ParseTrackConfig(response, &is_remote);
+      if (is_remote) cached_track_config_ = {{"track_config", response.at("track_config")}};
+      migration_ok = PersistTrackConfig() && migration_ok;
+    }
+    cached_response_ = response;
+    cached_response_.erase("hit_records");
+    cached_response_.erase("track_config");
+    if (needs_cleanup && migration_ok) PersistExperiments();  // 迁移成功后立即拆开旧合并文件。
+    const UserContext context = CurrentUserContext();
+    if (response.value(kCurrentUserIdKey, string()) != context.distinct_id ||
+        (response.count("is_login_id") &&
+         response.at("is_login_id").get<bool>() != context.is_login_id)) {
+      return;  // 只拒绝结果缓存，保留历史和配置。
+    }
+    response["is_login_id"] = context.is_login_id;
+    UpdateExperiments(response, context, false);
+  } catch (const exception &err) {
+    LogError("cannot restore experiment cache: " + string(err.what()));
+  }
+}
+
+void DefaultConsumer::PersistExperiments() {
+  json data;
+  {
+    lock_guard<mutex> lock(experiments_mtx_);
+    data = cached_response_;
+  }
+  if (!data.is_object()) return;
+  ofstream file(file_path_.c_str(), ofstream::out | ofstream::trunc);
+  if (!file) {
+    LogError("cannot open experiment cache for writing: " + file_path_);
+    return;
+  }
+  file << data.dump() << endl;
+  file.close();
+  if (!file) LogError("cannot write experiment cache: " + file_path_);
+}
+
+bool DefaultConsumer::PersistHitRecords() {
+  json data;
+  {
+    lock_guard<mutex> lock(experiments_mtx_);
+    data = json::object();
+    data["hit_records"] = json::array();
+    for (const auto &group : hit_records_) {
+      json entry;
+      if (get<0>(group.first)) {
+        entry["legacy_user"] = {{"distinct_id", get<2>(group.first)},
+                                {"is_login_id", get<3>(group.first)}};
+      } else {
+        entry["subject_name"] = get<1>(group.first);
+        entry["subject_id"] = get<2>(group.first);
+      }
+      entry["results"] = json::object();
+      for (const auto &value : group.second) {
+        const HitRecord &record = value.second;
+        json result = {{"abtest_experiment_id", record.experiment_id}};
+        if (!record.experiment_group_id.empty()) {
+          result["abtest_experiment_group_id"] = record.experiment_group_id;
+        }
+        if (!record.experiment_result_id.empty()) {
+          result["abtest_experiment_result_id"] = record.experiment_result_id;
+        }
+        entry["results"][value.first] = result;
+      }
+      data["hit_records"].push_back(entry);
+    }
+  }
+  ofstream file(hit_file_path_.c_str(), ofstream::out | ofstream::trunc);
+  if (!file) {
+    LogError("cannot open hit records for writing: " + hit_file_path_);
     return false;
   }
-
-  // 拷贝当前请求时的 distinct_id 内容，请求完成后对比是否为相同用户
-  string temp_distinct_id(distinct_id_);
-
-  json request_body;
-  request_body[(is_login_id_ ? "login_id" : "anonymous_id")] = distinct_id_;
-  request_body["abtest_lib_version"] = ABTESTING_SDK_VERSION;
-  request_body["platform"] = "cpp";
-  // 添加自定义属性，至少包含 "{}" 两个字符
-  if (custom_properties.length() > 2 && param_name.length() > 0) {
-      json custom_properties_json;
-      try {
-          custom_properties_json = json::parse(custom_properties);
-      } catch (exception &err) {
-        LogError("Exception when parse custom properties : " + (string)err.what());
-      }
-
-      if (!custom_properties_json.is_null()) {
-          request_body["custom_properties"] = custom_properties_json;
-          request_body["param_name"] = param_name;
-      }
-  }
-
-  string body = request_body.dump();
-
-  vector<HeaderFieldItem> headers = RequestHeaderFields(project_key_);
-  // 转换毫秒数为秒数
-  int timeout_second = timeout_millisecond / 1000;
-  try {
-    if (!request_->Request(body, headers, timeout_second)) {
-      // 接口请求失败时，直接返回默认值
-      handler(default_value);
-      return false;
-    }
-    string response_body;
-    request_->response_body_mtx_.lock();
-    response_body = request_->response_body_;
-    request_->response_body_mtx_.unlock();
-      
-    // 网络请求接口的返回是多线程，这里保证回调处理顺序
-    std::lock_guard<std::mutex> locker(handle_response_mtx_);
-
-    json response = json::parse(response_body);
-    if (response["status"] != "SUCCESS") {
-      // 当请求返回失败时， param_name 修改为空字符串，模拟类型匹配失败
-      LogError("request experiments failed!!!" + response_body);
-      HandleCompletion(param_name, default_value, handler);
-      return false;
-    }
-    // 当接口请求时的 distinct_id 和当前 distinct_id 不一致时，需要重新请求
-    if (temp_distinct_id != distinct_id_) {
-      return Request(param_name, default_value, timeout_millisecond, handler, custom_properties);
-    }
-
-    response[kCurrentUserIdKey] = distinct_id_;
-    string original_data = response.dump();
-    DumpExperimentsToDisk(original_data);
-    UpdateExperiments(original_data, true);
-
-    // callback when request success
-    HandleCompletion(param_name, default_value, handler);
-  } catch (exception &err) {
-    LogError("Exception when Request : " + (string)err.what());
+  file << data.dump() << endl;
+  file.close();
+  if (!file) {
+    LogError("cannot write hit records: " + hit_file_path_);
+    return false;
   }
   return true;
 }
 
-inline void DefaultConsumer::ClearExperimentsFromDisk() {
-  ofstream staging_ofs(file_path_.c_str(), ofstream::out | ofstream::trunc);
-  staging_ofs.close();
-}
-
-inline string DefaultConsumer::LoadExperimentsFromDisk() {
-  string original_data;
-  ifstream staging_ifs(file_path_.c_str(), ofstream::in);
-  staging_ifs >> original_data;
-  staging_ifs.close();
-  return original_data;
-}
-
-inline void DefaultConsumer::DumpExperimentsToDisk(
-    const string &original_data) {
-  ofstream staging_ofs(file_path_.c_str(), ofstream::out | ofstream::trunc);
-  staging_ofs << original_data << endl;
-  staging_ofs.close();
+bool DefaultConsumer::PersistTrackConfig() {
+  json data;
+  {
+    lock_guard<mutex> lock(experiments_mtx_);
+    data = cached_track_config_;
+  }
+  // 与 iOS 一致：没有有效远程配置时删除配置文件，恢复默认配置。
+  if (data.is_null()) {
+    if (std::remove(config_file_path_.c_str()) != 0 && errno != ENOENT) {
+      LogError("cannot remove track config: " + config_file_path_);
+      return false;
+    }
+    return true;
+  }
+  ofstream file(config_file_path_.c_str(), ofstream::out | ofstream::trunc);
+  if (!file) {
+    LogError("cannot open track config for writing: " + config_file_path_);
+    return false;
+  }
+  file << data.dump() << endl;
+  file.close();
+  if (!file) {
+    LogError("cannot write track config: " + config_file_path_);
+    return false;
+  }
+  return true;
 }
 
 bool DefaultConsumer::AssertKey(const string &type, const string &key) {
@@ -573,127 +928,118 @@ json DefaultConsumer::FetchExperimentResult(FetchMode fetch_mode,
   if (param_name.length() < 1) {
     LogError("param_name: " + param_name +
              " error，param_name must be a valid string!");
-    handler(default_value);
+    CompleteFetch(handler, default_value);
     return default_value;
   }
 
   if (!(default_value.is_number_integer() || default_value.is_string() ||
         default_value.is_boolean() || default_value.is_object())) {
     LogError("fetch param_name [" + param_name + "] failed, default_value type must be int/string/bool/json !");
-    handler(default_value);
+    CompleteFetch(handler, default_value);
     return default_value;
   }
 
   if (!AssertProperties(properties)) {
-    handler(default_value);
+    CompleteFetch(handler, default_value);
     return default_value;
   }
 
-  if (fetch_mode == kFetchModeCache) {
-    json result = FindExperimentResult(param_name, default_value);
-    if (result.is_null()) {
-      return default_value;
+  if (fetch_mode == kFetchModeCache || fetch_mode == kFetchModeFast) {
+    const json result = QueryAndTrack(param_name, default_value);
+    if (fetch_mode == kFetchModeCache) {
+      return result.is_null() ? default_value : result;
     }
-    TrackTriggerEvent(param_name);
-    return result;
-  } else if (fetch_mode == kFetchModeFast) {
-    json result = FindExperimentResult(param_name, default_value);
     if (!result.is_null()) {
-      // 当本地缓存数据不为空时，触发事件并直接返回实验结果
-      TrackTriggerEvent(param_name);
-      handler(result);
+      CompleteFetch(handler, result);
       return result;
     }
-    // 读取 Cache 失败后，尝试请求网络
-    string properties_json = "";
-    try {
-        properties_json = utils::ObjectNode::ToJson(properties);
-    } catch (exception &err) {
-        LogError("Exception when convert properties to json : " + (string)err.what());
-    }
-
-    const string custom_properties = properties_json;
-    async_futures_.push_back(async(launch::async, &DefaultConsumer::Request,
-                                   this, param_name, default_value,
-                                   timeout_milliseconds, handler, custom_properties));
-  } else if (fetch_mode == kFetchModeAsync) {
-    // 直接通过请求网络获取实验数据
-    string properties_json = "";
-    try {
-        properties_json = utils::ObjectNode::ToJson(properties);
-    } catch (exception &err) {
-        LogError("Exception when convert properties to json : " + (string)err.what());
-    }
-
-    const string custom_properties = properties_json;
-    async_futures_.push_back(async(launch::async, &DefaultConsumer::Request,
-                                   this, param_name, default_value,
-                                   timeout_milliseconds, handler, custom_properties));
   }
+  string custom_properties;
+  try {
+    custom_properties = utils::ObjectNode::ToJson(properties);
+  } catch (const exception &err) {
+    LogError("cannot serialize request properties: " + string(err.what()));
+    CompleteFetch(handler, default_value);
+    return default_value;
+  }
+  StoreAsyncFuture(async(launch::async, &DefaultConsumer::Request,
+                         this, param_name, default_value, timeout_milliseconds,
+                         handler, custom_properties));
   return default_value;
 }
 
-json DefaultConsumer::FindExperimentResult(const string &param_name,
-                                           const json &default_value) {
-  // 初始化空返回值
-  json result;
-
-  // 当查询的计划参数名无效时，直接返回
-  if (param_name.length() < 1) {
-    LogError("The cache experiment result is empty, param_name:" +
-               param_name);
-    return result;
-  }
-
-  // 使用临时变量，减少对成员变量的读取操作
-  map<string, ExperimentItem> experiments;
-  experiments_mtx_.lock();
-  experiments = experiments_;
-  experiments_mtx_.unlock();
-
-  // 当前计划列表为空时，直接返回
-  if (experiments.size() < 1) {
-    LogError("The cache experiment result is empty, param_name:" +
-                 param_name);
-    return result;
-  }
-
-  // 未查找到对应内容时，直接返回
-  if (experiments.find(param_name) == experiments.end()) {
-    LogError("The cache experiment result is empty, param_name:" +
-                   param_name);
-    return result;
-  }
-
-  ExperimentItem item = experiments.find(param_name)->second;
-  vector<ExperimentItemVar> variables = item.variables;
-  vector<ExperimentItemVar>::iterator iter;
-  ExperimentItemVar var;
-  for (iter = variables.begin(); iter != variables.end(); ++iter) {
-    if (iter->name == param_name) {
-      var = *iter;
+json DefaultConsumer::ConvertResult(const ExperimentItem &item,
+                                    const string &param_name,
+                                    const json &default_value) {
+  try {
+    for (const ExperimentItemVar &var : item.variables) {
+      if (var.name != param_name) {
+        continue;
+      }
+      if (!IsSameType(var.type, default_value)) {
+        LogError("experiment result type does not match default value: " + param_name);
+        return json();
+      }
+      if (var.type == "INTEGER") {
+        size_t consumed = 0;
+        const int result = stoi(var.value, &consumed);
+        return consumed == var.value.size() ? json(result) : json();
+      }
+      if (var.type == "BOOLEAN") {
+        if (var.value != "true" && var.value != "false") {
+          return json();
+        }
+        return var.value == "true";
+      }
+      if (var.type == "STRING") {
+        return var.value;
+      }
+      if (var.type == "JSON") {
+        const json result = json::parse(var.value);
+        return result.is_object() ? result : json();
+      }
     }
+  } catch (const exception &err) {
+    LogError("invalid experiment result: " + string(err.what()));
   }
-  if (!IsSameType(var.type, default_value)) {
-    string err_msg = "param_name [" + param_name + "] :" + "result value [" +
-                     var.value + "] of type [" + var.type +
-                     "] is not same for default value [" +
-                     default_value.dump() + "] !";
-    LogError(err_msg);
-    return result;
-  }
+  return json();
+}
 
-  // 类型转换，根据实验结果类型将 value 转换成对应类型
-  if (var.type == "INTEGER") {
-    result = stoi(var.value);
-  } else if (var.type == "BOOLEAN") {
-    result = (var.value == "true");
-  } else if (var.type == "STRING") {
-    result = var.value;
-  } else if (var.type == "JSON") {
-    result = json::parse(var.value);
+json DefaultConsumer::QueryAndTrack(const string &param_name,
+                                    const json &default_value,
+                                    const UserContext *request_context) {
+  lock_guard<mutex> hit_lock(hit_mtx_);
+  ExperimentItem item;
+  bool has_result = false;
+  vector<ExperimentItem> out_results;
+  TrackConfig config;
+  UserContext context;
+  {
+    lock_guard<mutex> lock(experiments_mtx_);
+    context = UserContext{distinct_id_, is_login_id_, user_generation_};
+    if (request_context && request_context->generation != context.generation) {
+      return json();
+    }
+    const auto found = experiments_.find(param_name);
+    if (found != experiments_.end()) {
+      item = found->second;
+      has_result = true;
+    }
+    const auto out = out_experiments_.find(param_name);
+    if (out != out_experiments_.end()) {
+      out_results = out->second;
+    }
+    config = track_config_;
   }
-  return result;
+  // 出组不需要正常参数值或类型；即使业务拿到默认值，也应更新出组。
+  for (const auto &out : out_results) {
+    TrackTriggerEvent(out, context, config);
+  }
+  const json result = has_result ? ConvertResult(item, param_name, default_value) : json();
+  if (!result.is_null()) {
+    TrackTriggerEvent(item, context, config);
+  }
+  return CurrentUserContext().generation == context.generation ? result : json();
 }
 
 bool DefaultConsumer::IsSameType(const string &type,
@@ -715,107 +1061,99 @@ bool DefaultConsumer::IsSameType(const string &type,
 
 void DefaultConsumer::HandleCompletion(const string &param_name,
                                        const json &default_value,
-                                       FetchHandler handler) {
-
-  if (param_name.length() < 1) {
-    // 当查询计划为空时，表示为内部自动请求回调，直接 return 即可
-    return;
-  }
-
-  json result = FindExperimentResult(param_name, default_value);
-  if (result.is_null()) {
-    // 获取实验结果失败，返回默认值
-    handler(default_value);
-    return;
-  }
-  handler(result);
-  TrackTriggerEvent(param_name);
+                                       FetchHandler handler,
+                                       const UserContext &request_context) {
+  const json result = QueryAndTrack(param_name, default_value, &request_context);
+  CompleteFetch(handler, result.is_null() ? default_value : result);
 }
 
-bool DefaultConsumer::IsTriggeredForExperiment(const string &experiment_id) {
-  typedef pair<string, vector<string>> TriggerdItem;
-  vector<TriggerdItem> triggered;
-  triggered_experiments_mtx_.lock();
-  triggered = triggered_experiments_;
-  triggered_experiments_mtx_.unlock();
-
-  for (vector<TriggerdItem>::iterator iter = triggered.begin();
-       iter != triggered.end(); ++iter) {
-    if (iter->first == distinct_id_) {
-      vector<string> list = iter->second;
-      return find(list.begin(), list.end(), experiment_id) != list.end();
+void DefaultConsumer::AddExtendedProperties(const ExperimentItem &item,
+                                            const TrackConfig &config,
+                                            PropertiesNode *properties) {
+  for (const string &key : config.extended_keys) {
+    if (key.empty() || key[0] == '$' || key == "abtest_experiment_id" ||
+        key == "abtest_experiment_group_id" || key == "lib_plugin_version" ||
+        key == "distinct_id" || key == "login_id" || key == "anonymous_id" ||
+        key.compare(0, 4, "sab_") == 0 || !AssertKey("extended property", "$" + key)) {
+      continue;
+    }
+    const auto found = item.extended_info.find(key);
+    if (found == item.extended_info.end() || found->is_null()) {
+      continue;
+    }
+    const string name = "$" + key;
+    if (found->is_string()) {
+      properties->SetString(name, found->get<string>());
+    } else if (found->is_boolean()) {
+      properties->SetBool(name, found->get<bool>());
+    } else if (found->is_number_integer()) {
+      // 底层属性整数为 int64_t，不将超界无符号整数截断为负数。
+      if (found->is_number_unsigned() &&
+          found->get<uint64_t>() > uint64_t(numeric_limits<int64_t>::max())) {
+        LogError("skip oversized integer extended property: " + key);
+      } else {
+        properties->SetNumber(name, found->get<int64_t>());
+      }
+    } else if (found->is_number_float() && isfinite(found->get<double>())) {
+      properties->SetNumber(name, found->get<double>());
+    } else if (found->is_array() && all_of(found->begin(), found->end(),
+                                         [](const json &v) { return v.is_string(); })) {
+      properties->SetList(name, found->get<vector<string>>());
+    } else {
+      LogError("skip unsupported extended property: " + key);
     }
   }
-  return false;
 }
 
-void DefaultConsumer::AddTriggeredExperiment(const string &experiment_id) {
-  typedef pair<string, vector<string>> TriggerdItem;
-
-  vector<TriggerdItem> triggered;
-  triggered_experiments_mtx_.lock();
-  triggered = triggered_experiments_;
-  triggered_experiments_mtx_.unlock();
-
-  bool add_success = false;
-  for (vector<TriggerdItem>::iterator iter = triggered.begin();
-       iter != triggered.end(); ++iter) {
-    if (iter->first == distinct_id_) {
-      iter->second.push_back(experiment_id);
-      add_success = true;
+void DefaultConsumer::TrackTriggerEvent(const ExperimentItem &item,
+                                       const UserContext &context,
+                                       const TrackConfig &config) {
+  if (item.is_white_list) {
+    return;
+  }
+  {
+    lock_guard<mutex> write_lock(handle_response_mtx_);
+    {
+      lock_guard<mutex> state_lock(experiments_mtx_);
+      if (context.generation != user_generation_) return;
+      auto &records = hit_records_[HitSubject(item, context)];
+      const auto found = records.find(item.experiment_id);
+      HitRecord next{item.experiment_id, item.experiment_group_id,
+                     item.experiment_result_id};
+      if (found != records.end()) {
+        const HitRecord &previous = found->second;
+        const bool changed = !previous.experiment_result_id.empty() && !next.experiment_result_id.empty()
+            ? previous.experiment_result_id != next.experiment_result_id
+            : previous.experiment_group_id != next.experiment_group_id;
+        if (!changed) {
+          // 旧协议同组补齐结果 ID 仅更新内存，重复命中不重写文件。
+          if (!next.experiment_result_id.empty()) records[item.experiment_id] = next;
+          return;
+        }
+      }
+      records[item.experiment_id] = next;
     }
+    PersistHitRecords();
   }
-  // 当前 triggered_experiments_ 中无对应 distinct_id 时需要新增
-  if (!add_success) {
-    vector<string> experiments_ids;
-    experiments_ids.push_back(experiment_id);
-    triggered.push_back(TriggerdItem(distinct_id_, experiments_ids));
-  }
-
-  triggered_experiments_mtx_.lock();
-  triggered_experiments_ = triggered;
-  triggered_experiments_mtx_.unlock();
-}
-
-void DefaultConsumer::TrackTriggerEvent(const string &param_name) {
-  map<string, ExperimentItem> experiments;
-  triggered_experiments_mtx_.lock();
-  experiments = experiments_;
-  triggered_experiments_mtx_.unlock();
-
-  // 当前计划列表为空时，直接返回
-  if (experiments.size() < 1) {
-    return;
-  }
-
-  // 未查找到对应内容时，直接返回
-  if (experiments.find(param_name) == experiments.end()) {
-    return ;
-  }
-
-  ExperimentItem item = experiments.find(param_name)->second;
-  bool is_contained = IsTriggeredForExperiment(item.experiment_id);
-  if (is_contained || item.is_white_list) {
-    return;
-  }
-
-  // 触发 $ABTestTrigger 事件
-  PropertiesNode properties;
-  properties.SetString("$abtest_experiment_id", item.experiment_id);
-  properties.SetString("$abtest_experiment_group_id", item.experiment_group_id);
-
-  // 当触发过 trigger event 后修改标志位为 false
-  if (is_first_trigger_event_) {
+  // iOS 先更新命中历史，再按开关决定是否发送触发事件。
+  if (!config.trigger_switch) return;
+  try {
+    PropertiesNode properties;
+    properties.SetString("$abtest_experiment_id", item.experiment_id);
+    if (!item.experiment_group_id.empty()) {
+      properties.SetString("$abtest_experiment_group_id", item.experiment_group_id);
+    }
+    AddExtendedProperties(item, config, &properties);
+    if (is_first_trigger_event_) {
+      properties.SetList("$lib_plugin_version",
+                         vector<string>(1, "cpp_abtesting:" + string(ABTESTING_SDK_VERSION)));
+    }
+    // 调用时仅持命中串行锁，不持状态锁或响应/写盘锁。
+    sensors_analytics::Sdk::Track("$ABTestTrigger", properties);
     is_first_trigger_event_ = false;
-    vector<string> version;
-    string sdk_version = ABTESTING_SDK_VERSION;
-    version.push_back("cpp_abtesting:" + sdk_version);
-    properties.SetList("$lib_plugin_version", version);
+  } catch (const exception &err) {
+    LogError("track experiment failed: " + string(err.what()));
   }
-  sensors_analytics::Sdk::Track("$ABTestTrigger", properties);
-
-  // 记录当前用户已触发过此实验的 $ABTestTrigger 事件
-  AddTriggeredExperiment(item.experiment_id);
 }
 
 Sdk *Sdk::instance_ = NULL;
